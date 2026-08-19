@@ -87,6 +87,17 @@ logger = logging.getLogger("groupguard")
 # =====================================================================
 # تنظیمات (config.py)
 # =====================================================================
+# 🔑 اگه نمی‌خوای رو Railway متغیرهای محیطی ست کنی، می‌تونی همینجا مستقیم
+# توکن و آیدی‌هات رو بنویسی. اگه اینجا پر باشه، دیگه لازم نیست تو تب
+# Variables چیزی ست کنی (اولویت با متغیر محیطی‌ست، ولی اگه خالی بود میاد سراغ این‌ها).
+#
+# ⚠️ فقط اگه ریپوی گیت‌هابت PRIVATE هست از این روش استفاده کن، و مطمئن شو
+# هیچ‌وقت public/فورک نمی‌شه — چون یه بار push شدن توکن یعنی برای همیشه تو
+# تاریخچه‌ی گیت می‌مونه، حتی اگه تو کامیت بعدی حذفش کنی.
+HARDCODED_BOT_TOKEN = ""  # مثل: "123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+HARDCODED_OWNER_IDS = ""  # مثل: "123456789,987654321"
+
+
 @dataclass
 class Config:
     bot_token: str
@@ -100,12 +111,13 @@ class Config:
 
 def load_config() -> Config:
     load_dotenv()
-    token = os.getenv("BOT_TOKEN", "").strip()
+    token = (os.getenv("BOT_TOKEN", "").strip()) or HARDCODED_BOT_TOKEN.strip()
     if not token:
         raise RuntimeError(
-            "❌ متغیر BOT_TOKEN تنظیم نشده. یک فایل .env بساز و توکن ربات رو توش بذار."
+            "❌ توکن ربات تنظیم نشده. یا متغیر محیطی BOT_TOKEN رو ست کن، یا مقدار "
+            "HARDCODED_BOT_TOKEN رو بالای همین فایل پر کن."
         )
-    owners_raw = os.getenv("OWNER_IDS", "")
+    owners_raw = os.getenv("OWNER_IDS", "").strip() or HARDCODED_OWNER_IDS
     owners = {
         int(x) for x in owners_raw.replace(" ", "").split(",") if x.strip().lstrip("-").isdigit()
     }
@@ -815,6 +827,10 @@ class BackCallback(CallbackData, prefix="setback"):
     chat_id: int
 
 
+class SelectGroupCallback(CallbackData, prefix="selgrp"):
+    chat_id: int
+
+
 def settings_main_keyboard(chat_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="🔒 قفل‌ها و فیلترها", callback_data=SettingsMenuCallback(chat_id=chat_id, section="locks").pack())
@@ -929,13 +945,93 @@ HELP_TEXT = (
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     if message.chat.type == "private":
-        await message.answer(
-            "👋 سلام! من یه ربات مدیریت گروه حرفه‌ای‌ام.\n\n"
-            "من رو به گروهت اضافه کن و ادمین کامل بده، بعد داخل گروه با دستور "
-            "/settings تنظیماتم رو باز کن.\n\nبرای لیست کامل دستورها: /help"
+        me = await message.bot.get_me()
+        builder = InlineKeyboardBuilder()
+        builder.button(text="➕ افزودن به گروه", url=f"https://t.me/{me.username}?startgroup=true")
+        builder.button(text="⚙️ مدیریت گروه‌هام", callback_data="show_my_groups")
+        builder.button(text="📚 راهنمای کامل", callback_data="show_help")
+        builder.adjust(1)
+        await message.reply(
+            "👋 <b>سلام، خوش اومدی!</b>\n\n"
+            "من یه ربات حرفه‌ای مدیریت گروه‌م 🛡\n\n"
+            "🌊 ضداسپم و ضدفلود\n"
+            "🔒 قفل لینک/فوروارد/منشن/استیکر/گیف/عکس/ویدیو/...\n"
+            "⚠️ سیستم اخطار با مجازات خودکار (میوت/اخراج/بن)\n"
+            "🧹 فیلتر کلمات و لیست سیاه\n"
+            "👋 خوش‌آمدگویی و قوانین اختصاصی\n"
+            "📊 آمار گروه + پنل تنظیمات کامل (حتی از همین‌جا تو پیوی!)\n\n"
+            "برای شروع، با دکمه‌ی زیر من رو به گروهت اضافه کن و "
+            "<b>ادمین کامل</b> بده 👇",
+            reply_markup=builder.as_markup(),
         )
     else:
-        await message.answer("👋 سلام! برای مدیریت گروه از /settings یا /help استفاده کن.")
+        await message.reply("👋 سلام! برای مدیریت گروه از /settings یا /help استفاده کن.")
+
+
+async def _get_admin_group_chats(bot: Bot, session: AsyncSession, user_id: int) -> List[Chat]:
+    result = await session.execute(select(Chat))
+    all_chats = result.scalars().all()
+    admin_chats: List[Chat] = []
+    for c in all_chats:
+        if await is_chat_admin(bot, c.id, user_id):
+            admin_chats.append(c)
+    return admin_chats
+
+
+def _groups_list_keyboard(chats: List[Chat]):
+    builder = InlineKeyboardBuilder()
+    for c in chats:
+        builder.button(text=c.title or str(c.id), callback_data=SelectGroupCallback(chat_id=c.id).pack())
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data == "show_help")
+async def on_show_help(callback: CallbackQuery) -> None:
+    await callback.message.answer(HELP_TEXT)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "show_my_groups")
+async def on_show_my_groups(callback: CallbackQuery, session: AsyncSession) -> None:
+    admin_chats = await _get_admin_group_chats(callback.bot, session, callback.from_user.id)
+    if not admin_chats:
+        await callback.answer(
+            "گروهی پیدا نکردم که هم من توش باشم هم تو ادمینش باشی. اول من رو به گروهت اضافه و ادمین کن.",
+            show_alert=True,
+        )
+        return
+    await callback.message.answer("کدوم گروه رو می‌خوای مدیریت کنی؟", reply_markup=_groups_list_keyboard(admin_chats))
+    await callback.answer()
+
+
+# --- مدیریت گروه از داخل پیوی (بدون نیاز به داخل گروه بودن) ---
+@router.message(Command("settings", "تنظیمات"), F.chat.type == "private")
+async def cmd_settings_private(message: Message, session: AsyncSession) -> None:
+    admin_chats = await _get_admin_group_chats(message.bot, session, message.from_user.id)
+    if not admin_chats:
+        await message.reply(
+            "گروهی پیدا نکردم که هم من توش باشم هم تو ادمینش باشی.\n"
+            "اول من رو با /start به گروهت اضافه کن و ادمین کامل بده."
+        )
+        return
+    await message.reply("کدوم گروه رو می‌خوای مدیریت کنی؟", reply_markup=_groups_list_keyboard(admin_chats))
+
+
+@router.callback_query(SelectGroupCallback.filter())
+async def on_select_group(callback: CallbackQuery, callback_data: SelectGroupCallback, session: AsyncSession) -> None:
+    if not await is_chat_admin(callback.bot, callback_data.chat_id, callback.from_user.id):
+        await callback.answer("❌ دیگه ادمین این گروه نیستی.", show_alert=True)
+        return
+    chat = await get_chat_by_id(session, callback_data.chat_id)
+    if chat is None:
+        await callback.answer("❌ این گروه پیدا نشد.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"⚙️ <b>پنل تنظیمات گروه «{html.escape(chat.title or str(chat.id))}»</b>\nیکی از بخش‌ها رو انتخاب کن:",
+        reply_markup=settings_main_keyboard(chat.id),
+    )
+    await callback.answer()
 
 
 @router.message(Command("help", "راهنما"))
