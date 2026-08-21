@@ -167,8 +167,8 @@ class Chat(Base):
     lock_video: Mapped[bool] = mapped_column(Boolean, default=False)
     lock_voice: Mapped[bool] = mapped_column(Boolean, default=False)
     lock_document: Mapped[bool] = mapped_column(Boolean, default=False)
-    lock_bot_join: Mapped[bool] = mapped_column(Boolean, default=True)
-    lock_deleted_accounts: Mapped[bool] = mapped_column(Boolean, default=True)
+    lock_bot_join: Mapped[bool] = mapped_column(Boolean, default=False)
+    lock_deleted_accounts: Mapped[bool] = mapped_column(Boolean, default=False)
     lock_all_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     # --- فیلتر کلمات ---
@@ -274,6 +274,42 @@ def parse_duration(text: str) -> Optional[timedelta]:
     return timedelta(seconds=seconds)
 
 
+FA_DURATION_UNITS = {
+    "دقیقه": "m", "دقيقه": "m", "دیقه": "m",
+    "ساعت": "h",
+    "روز": "d",
+    "هفته": "w",
+    "ثانیه": "s",
+}
+
+
+def parse_duration_fa(text: str) -> Optional[timedelta]:
+    """
+    هم فرمت کوتاه (30m، 2h، 1d) و هم فرمت فارسی («2 ساعت»، «۳۰دقیقه») رو می‌فهمه.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    # اول فرمت کوتاه رو امتحان کن
+    direct = parse_duration(text.split()[0])
+    if direct is not None:
+        return direct
+
+    # تبدیل ارقام فارسی/عربی به لاتین
+    digits_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    normalized = text.translate(digits_map)
+
+    match = re.match(r"^(\d+)\s*([آ-ی]+)$", normalized)
+    if not match:
+        return None
+    value, unit_word = match.group(1), match.group(2)
+    unit = FA_DURATION_UNITS.get(unit_word)
+    if unit is None:
+        return None
+    return parse_duration(f"{value}{unit}")
+
+
 def mention_html(user: TgUser) -> str:
     name = html.escape(user.full_name or str(user.id))
     return f'<a href="tg://user?id={user.id}">{name}</a>'
@@ -357,6 +393,26 @@ def invalidate_admin_cache(chat_id: int) -> None:
 # --- ردیاب فلود در حافظه ---
 _flood_tracker: Dict[Tuple[int, int], Deque[float]] = defaultdict(deque)
 
+# --- ردیاب کاربرانی که الان سکوت‌شون فعاله (برای پاکسازی خودکار پیام‌های احتمالی) ---
+_muted_users: Dict[int, Set[int]] = defaultdict(set)
+
+
+def mark_muted(chat_id: int, user_id: int) -> None:
+    _muted_users[chat_id].add(user_id)
+
+
+def unmark_muted(chat_id: int, user_id: int) -> None:
+    _muted_users[chat_id].discard(user_id)
+
+
+def is_marked_muted(chat_id: int, user_id: int) -> bool:
+    return user_id in _muted_users[chat_id]
+
+
+# --- ست‌اپ ساده‌ی خوش‌آمدگویی/قوانین با یک پیام (بدون دستور) ---
+# کلید: (chat_id, user_id) -> "welcome" یا "rules"
+_pending_text_setup: Dict[Tuple[int, int], str] = {}
+
 
 def check_flood(chat_id: int, user_id: int, limit: int, window: int) -> bool:
     key = (chat_id, user_id)
@@ -372,6 +428,8 @@ URL_RE = re.compile(
     r"(https?://|www\.|t\.me/|telegram\.me/|[a-z0-9-]+\.(ir|com|net|org|io|xyz|info))",
     re.IGNORECASE,
 )
+# آیدی/یوزرنیم به شکل @channel هم زیرمجموعه‌ی «لینک» حساب می‌شه (چون همون لینک عضویته)
+AT_USERNAME_RE = re.compile(r"@[a-zA-Z0-9_]{4,32}")
 
 
 def _render_welcome(template: str, member: TgUser, chat_title: str) -> str:
@@ -601,13 +659,16 @@ async def apply_punishment(
     until = (datetime.utcnow() + duration) if duration else None
     if action == "mute":
         await bot.restrict_chat_member(chat_id, user_id, permissions=MUTE_PERMISSIONS, until_date=until)
+        mark_muted(chat_id, user_id)
         if duration:
             await add_timed_action(session, chat_id, user_id, "unmute", datetime.utcnow() + duration)
     elif action == "kick":
         await bot.ban_chat_member(chat_id, user_id)
         await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        unmark_muted(chat_id, user_id)
     elif action == "ban":
         await bot.ban_chat_member(chat_id, user_id, until_date=until)
+        unmark_muted(chat_id, user_id)
         if duration:
             await add_timed_action(session, chat_id, user_id, "unban", datetime.utcnow() + duration)
     else:
@@ -700,11 +761,11 @@ def detect_lock_violation(message: Message, chat: Chat) -> Optional[str]:
 
     if chat.lock_link:
         text = message.text or message.caption or ""
-        if URL_RE.search(text):
+        if URL_RE.search(text) or AT_USERNAME_RE.search(text):
             return "لینک"
         entities = (message.entities or []) + (message.caption_entities or [])
         for ent in entities:
-            if ent.type in ("url", "text_link"):
+            if ent.type in ("url", "text_link", "mention", "text_mention"):
                 return "لینک"
 
     if chat.lock_mention:
@@ -762,6 +823,11 @@ class ModerationMiddleware:
         bot: Bot = data["bot"]
 
         chat = await get_or_create_chat(session, event.chat)
+
+        # خط دفاعی اضافه: اگه کاربر الان سکوته ولی به هر دلیلی پیامش رد شده، پاکش کن
+        if is_marked_muted(event.chat.id, event.from_user.id):
+            await _safe_delete(event)
+            return None
 
         if await is_chat_admin(bot, event.chat.id, event.from_user.id):
             await record_message_stat(session, event.chat.id, event.from_user.id)
@@ -906,7 +972,18 @@ async def _resolve_target(message: Message) -> Optional[TgUser]:
 
 HELP_TEXT = (
     "🤖 <b>راهنمای ربات مدیریت گروه</b>\n\n"
-    "<b>مدیریت اعضا:</b>\n"
+    "<b>⚡️ فرمان سریع بدون اسلش (فقط ادمین، با ریپلای روی پیام فرد):</b>\n"
+    "«کیک» یا «اخراج» — اخراج از گروه\n"
+    "«بن» — مسدود کردن\n"
+    "«رفع بن» — رفع مسدودیت\n"
+    "«لال» یا «سکوت» — سکوت دائم؛ «سکوت 1h» یا «سکوت 2 ساعت» — سکوت زمان‌دار\n"
+    "«رفع سکوت» — باز کردن سکوت\n"
+    "«اخطار» یا «اخطار دلیلش» — ثبت اخطار\n"
+    "«ادمین» — ارتقا به ادمین\n"
+    "«برکناری» یا «عزل» — عزل از ادمینی\n"
+    "«لیست ادمین» — لیست ادمین‌ها\n"
+    "«پاکسازی» — پاک کردن از پیام ریپلای‌شده تا الان\n\n"
+    "<b>مدیریت اعضا (دستوری):</b>\n"
     "/mute /tmute [مدت] — سکوت (ریپلای)\n"
     "/unmute — رفع سکوت (ریپلای)\n"
     "/ban /tban [مدت] — بن (ریپلای)\n"
@@ -922,7 +999,7 @@ HELP_TEXT = (
     "/promote [عنوان] — ارتقا به ادمین (ریپلای)\n"
     "/demote — عزل ادمین (ریپلای)\n"
     "/adminlist — لیست ادمین‌ها\n\n"
-    "<b>قفل‌ها:</b>\n"
+    "<b>قفل‌ها (همه پیش‌فرض خاموش، از /settings روشن کن):</b>\n"
     "/locks — وضعیت قفل‌ها\n"
     "/lockall [مدت] — قفل کامل گروه\n"
     "/unlockall — باز کردن قفل کامل\n\n"
@@ -930,8 +1007,9 @@ HELP_TEXT = (
     "/addword /delword /words — مدیریت کلمات ممنوعه\n"
     "/blacklist add|del|list — مدیریت لیست سیاه کاربران\n\n"
     "<b>تنظیمات متنی:</b>\n"
-    "/setwelcome /resetwelcome — متن خوش‌آمد ({name} {mention} {id} {chat})\n"
-    "/setrules — تنظیم قوانین\n"
+    "/setwelcome /resetwelcome — متن خوش‌آمد؛ اگه بدون متن بفرستی، پیام بعدیت خودکار ذخیره می‌شه\n"
+    "متغیرها: {name} {mention} {id} {chat}\n"
+    "/setrules — تنظیم قوانین (همون‌طور، بدون متن هم کار می‌کنه)\n"
     "/rules — نمایش قوانین\n"
     "/setwarnlimit /setwarnaction — تنظیمات اخطار\n"
     "/setflood /setfloodaction — تنظیمات ضداسپم\n\n"
@@ -1048,21 +1126,44 @@ async def cmd_id(message: Message) -> None:
 
 
 # --- مجازات‌ها ---
+async def _apply_punish_to_target(
+    message: Message,
+    session: AsyncSession,
+    target: TgUser,
+    action: str,
+    duration: Optional[timedelta] = None,
+    duration_label: str = "",
+    reason: str = "",
+) -> bool:
+    """اعتبارسنجی و اعمال مجازات روی یک هدف. اگه موفق بود True برمی‌گردونه."""
+    if target.id == message.from_user.id:
+        await message.reply("❌ نمی‌تونی این کارو رو خودت انجام بدی.")
+        return False
+    if target.id == message.bot.id:
+        await message.reply("❌ نمی‌تونم رو خودم این کارو انجام بدم 🙂")
+        return False
+    if await is_chat_admin(message.bot, message.chat.id, target.id):
+        await message.reply("❌ این فرد ادمین گروهه و نمی‌تونم این کارو روش انجام بدم.")
+        return False
+
+    try:
+        await apply_punishment(message.bot, session, message.chat.id, target.id, action, duration)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        await message.reply(f"❌ خطا: {exc}")
+        return False
+
+    dur_text = f" برای مدت {duration_label}" if duration_label else ""
+    reason_text = f"\nدلیل: {html.escape(reason)}" if reason else ""
+    await message.reply(f"✅ {mention_html(target)} {ACTION_FA[action]} شد{dur_text}.{reason_text}")
+    return True
+
+
 async def _handle_punish_command(
     message: Message, session: AsyncSession, action: str, require_duration: bool
 ) -> None:
     target = await _resolve_target(message)
     if target is None:
         await message.reply("❗️ باید روی پیام فرد موردنظر ریپلای کنی.")
-        return
-    if target.id == message.from_user.id:
-        await message.reply("❌ نمی‌تونی این کارو رو خودت انجام بدی.")
-        return
-    if target.id == message.bot.id:
-        await message.reply("❌ نمی‌تونم رو خودم این کارو انجام بدم 🙂")
-        return
-    if await is_chat_admin(message.bot, message.chat.id, target.id):
-        await message.reply("❌ این فرد ادمین گروهه و نمی‌تونم این کارو روش انجام بدم.")
         return
 
     args = (message.text or "").split(maxsplit=1)
@@ -1082,15 +1183,7 @@ async def _handle_punish_command(
         await message.reply("❗️ باید مدت زمان رو مشخص کنی. مثال: /tmute 1h")
         return
 
-    try:
-        await apply_punishment(message.bot, session, message.chat.id, target.id, action, duration)
-    except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        await message.reply(f"❌ خطا: {exc}")
-        return
-
-    dur_text = f" برای مدت {duration_label}" if duration_label else ""
-    reason_text = f"\nدلیل: {html.escape(reason)}" if reason else ""
-    await message.reply(f"✅ {mention_html(target)} {ACTION_FA[action]} شد{dur_text}.{reason_text}")
+    await _apply_punish_to_target(message, session, target, action, duration, duration_label, reason)
 
 
 @router.message(Command("mute"), GroupAdminFilter())
@@ -1118,18 +1211,38 @@ async def cmd_kick(message: Message, session: AsyncSession) -> None:
     await _handle_punish_command(message, session, "kick", require_duration=False)
 
 
+async def _unmute_target(message: Message, target: TgUser) -> None:
+    try:
+        await message.bot.restrict_chat_member(message.chat.id, target.id, permissions=DEFAULT_PERMISSIONS)
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        await message.reply(f"❌ خطا: {exc}")
+        return
+    unmark_muted(message.chat.id, target.id)
+    await message.reply(f"🔊 سکوت {mention_html(target)} برداشته شد.")
+
+
 @router.message(Command("unmute"), GroupAdminFilter())
 async def cmd_unmute(message: Message) -> None:
     target = await _resolve_target(message)
     if target is None:
         await message.reply("❗️ روی پیام فرد موردنظر ریپلای کن.")
         return
+    await _unmute_target(message, target)
+
+
+UNBAN_NOTE = (
+    "\nℹ️ توجه: تلگرام به هیچ ربات‌ای اجازه نمی‌ده کاربر رو زوری به گروه برگردونه؛ "
+    "این محدودیت خود پلتفرم تلگرامه. کاربر فقط با لینک دعوت گروه می‌تونه خودش دوباره عضو بشه."
+)
+
+
+async def _unban_target_id(message: Message, target_id: int) -> None:
     try:
-        await message.bot.restrict_chat_member(message.chat.id, target.id, permissions=DEFAULT_PERMISSIONS)
+        await message.bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         await message.reply(f"❌ خطا: {exc}")
         return
-    await message.reply(f"🔊 سکوت {mention_html(target)} برداشته شد.")
+    await message.reply(f"✅ رفع مسدودیت کاربر <code>{target_id}</code> انجام شد.{UNBAN_NOTE}")
 
 
 @router.message(Command("unban"), GroupAdminFilter())
@@ -1142,12 +1255,7 @@ async def cmd_unban(message: Message) -> None:
     if target_id is None:
         await message.reply("❗️ روی پیام فرد ریپلای کن یا آیدی عددی بده.")
         return
-    try:
-        await message.bot.unban_chat_member(message.chat.id, target_id, only_if_banned=True)
-    except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        await message.reply(f"❌ خطا: {exc}")
-        return
-    await message.reply("✅ رفع مسدودیت انجام شد.")
+    await _unban_target_id(message, target_id)
 
 
 @router.message(Command("warn"), GroupAdminFilter())
@@ -1184,6 +1292,26 @@ async def cmd_resetwarns(message: Message, session: AsyncSession) -> None:
 
 
 # --- پاکسازی ---
+async def _purge_range(message: Message, start_id: int, end_id: int) -> int:
+    """حذف دسته‌جمعی پیام‌ها با API بولک تلگرام (سریع و بدون محدودیت نرخ سنگین)."""
+    all_ids = list(range(start_id, end_id + 1))
+    deleted = 0
+    for i in range(0, len(all_ids), 100):
+        chunk = all_ids[i : i + 100]
+        try:
+            await message.bot.delete_messages(chat_id=message.chat.id, message_ids=chunk)
+            deleted += len(chunk)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            # اگه حذف دسته‌ای شکست خورد، تک‌تک امتحان کن
+            for mid in chunk:
+                try:
+                    await message.bot.delete_message(message.chat.id, mid)
+                    deleted += 1
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    continue
+    return deleted
+
+
 @router.message(Command("purge"), GroupAdminFilter())
 async def cmd_purge(message: Message) -> None:
     if not message.reply_to_message:
@@ -1191,16 +1319,10 @@ async def cmd_purge(message: Message) -> None:
         return
     start_id = message.reply_to_message.message_id
     end_id = message.message_id
-    if end_id - start_id > 500:
-        await message.reply("❗️ بازه‌ی پاکسازی خیلی بزرگه (حداکثر ۵۰۰ پیام).")
+    if end_id - start_id > 2000:
+        await message.reply("❗️ بازه‌ی پاکسازی خیلی بزرگه (حداکثر ۲۰۰۰ پیام).")
         return
-    deleted = 0
-    for mid in range(start_id, end_id + 1):
-        try:
-            await message.bot.delete_message(message.chat.id, mid)
-            deleted += 1
-        except (TelegramBadRequest, TelegramForbiddenError):
-            continue
+    deleted = await _purge_range(message, start_id, end_id)
     notice = await message.answer(f"🧹 {deleted} پیام پاک شد.")
     await asyncio.sleep(4)
     try:
@@ -1221,15 +1343,110 @@ async def cmd_del(message: Message) -> None:
         await message.reply("❌ نتونستم پیام رو حذف کنم.")
 
 
-# --- ادمین‌ها ---
-@router.message(Command("promote"), GroupAdminFilter())
-async def cmd_promote(message: Message) -> None:
+# =====================================================================
+# دستورهای طبیعی فارسی (بدون اسلش) — فقط با ریپلای روی پیام کاربر
+# =====================================================================
+NL_EXACT_TRIGGERS: Dict[str, str] = {
+    "کیک": "kick", "سیک": "kick", "اخراج": "kick",
+    "بن": "ban",
+    "رفع بن": "unban", "آنبن": "unban", "رفع مسدودیت": "unban",
+    "رفع سکوت": "unmute", "رفع لال": "unmute", "باز کردن سکوت": "unmute",
+    "ادمین": "promote", "ادمین کن": "promote",
+    "برداشتن ادمین": "demote", "برکناری": "demote", "عزل ادمین": "demote", "عزل": "demote",
+    "لیست ادمین": "adminlist", "لیست ادمینا": "adminlist", "لیست ادمین ها": "adminlist",
+    "پاکسازی": "purge",
+    "لال": "mute", "سکوت": "mute",
+    "اخطار": "warn",
+}
+NL_PREFIX_TRIGGERS: Dict[str, str] = {"لال": "mute", "سکوت": "mute", "اخطار": "warn"}
+
+
+def _normalize_fa(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+class NaturalTriggerFilter(BaseFilter):
+    """فقط پیام‌های ریپلای‌شده که دقیقاً یکی از کلمات فرمان فارسی‌ان رو می‌گیره."""
+
+    async def __call__(self, message: Message) -> bool:
+        if not message.reply_to_message or not message.text:
+            return False
+        norm = _normalize_fa(message.text)
+        if not norm or norm.startswith("/"):
+            return False
+        if norm in NL_EXACT_TRIGGERS:
+            return True
+        first_word = norm.split(maxsplit=1)[0]
+        return first_word in NL_PREFIX_TRIGGERS
+
+
+@router.message(NaturalTriggerFilter())
+async def cmd_natural_language_actions(message: Message, session: AsyncSession) -> None:
+    # فقط ادمین‌های گروه می‌تونن این کلمات رو فرمان حساب کنن؛ برای بقیه بی‌سروصدا نادیده می‌گیریم
+    if not await is_chat_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+
+    norm = _normalize_fa(message.text or "")
+    action = NL_EXACT_TRIGGERS.get(norm)
+    rest = ""
+    if action is None:
+        parts = norm.split(maxsplit=1)
+        first = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        action = NL_PREFIX_TRIGGERS.get(first)
+    if action is None:
+        return
+
+    if action == "adminlist":
+        await cmd_adminlist(message)
+        return
+    if action == "purge":
+        await cmd_purge(message)
+        return
+
     target = await _resolve_target(message)
     if target is None:
-        await message.reply("❗️ روی پیام فرد موردنظر ریپلای کن.")
+        await message.reply("❗️ باید روی پیام فرد موردنظر ریپلای کنی.")
         return
-    args = (message.text or "").split(maxsplit=1)
-    custom_title = args[1][:16] if len(args) > 1 else None
+
+    if action in ("kick", "ban"):
+        await _apply_punish_to_target(message, session, target, action)
+        return
+
+    if action == "mute":
+        duration = parse_duration_fa(rest) if rest else None
+        duration_label = rest if duration else ""
+        await _apply_punish_to_target(message, session, target, "mute", duration, duration_label)
+        return
+
+    if action == "unmute":
+        await _unmute_target(message, target)
+        return
+
+    if action == "unban":
+        await _unban_target_id(message, target.id)
+        return
+
+    if action == "promote":
+        await _promote_target(message, target)
+        return
+
+    if action == "demote":
+        await _demote_target(message, target)
+        return
+
+    if action == "warn":
+        if await is_chat_admin(message.bot, message.chat.id, target.id):
+            await message.reply("❌ نمی‌تونم به ادمین اخطار بدم.")
+            return
+        reason = rest or "بدون دلیل"
+        chat = await get_or_create_chat(session, message.chat)
+        await issue_warn(message.bot, session, chat, message.chat.id, target, reason)
+        return
+
+
+# --- ادمین‌ها ---
+async def _promote_target(message: Message, target: TgUser, custom_title: Optional[str] = None) -> None:
     try:
         await message.bot.promote_chat_member(
             message.chat.id,
@@ -1243,7 +1460,7 @@ async def cmd_promote(message: Message) -> None:
             can_manage_video_chats=True,
         )
         if custom_title:
-            await message.bot.set_chat_administrator_custom_title(message.chat.id, target.id, custom_title)
+            await message.bot.set_chat_administrator_custom_title(message.chat.id, target.id, custom_title[:16])
     except (TelegramBadRequest, TelegramForbiddenError) as exc:
         await message.reply(f"❌ خطا: {exc}")
         return
@@ -1251,12 +1468,7 @@ async def cmd_promote(message: Message) -> None:
     await message.reply(f"⭐️ {mention_html(target)} ادمین شد.")
 
 
-@router.message(Command("demote"), GroupAdminFilter())
-async def cmd_demote(message: Message) -> None:
-    target = await _resolve_target(message)
-    if target is None:
-        await message.reply("❗️ روی پیام فرد موردنظر ریپلای کن.")
-        return
+async def _demote_target(message: Message, target: TgUser) -> None:
     try:
         await message.bot.promote_chat_member(
             message.chat.id,
@@ -1274,6 +1486,26 @@ async def cmd_demote(message: Message) -> None:
         return
     invalidate_admin_cache(message.chat.id)
     await message.reply(f"⬇️ {mention_html(target)} از ادمینی عزل شد.")
+
+
+@router.message(Command("promote"), GroupAdminFilter())
+async def cmd_promote(message: Message) -> None:
+    target = await _resolve_target(message)
+    if target is None:
+        await message.reply("❗️ روی پیام فرد موردنظر ریپلای کن.")
+        return
+    args = (message.text or "").split(maxsplit=1)
+    custom_title = args[1] if len(args) > 1 else None
+    await _promote_target(message, target, custom_title)
+
+
+@router.message(Command("demote"), GroupAdminFilter())
+async def cmd_demote(message: Message) -> None:
+    target = await _resolve_target(message)
+    if target is None:
+        await message.reply("❗️ روی پیام فرد موردنظر ریپلای کن.")
+        return
+    await _demote_target(message, target)
 
 
 @router.message(Command("adminlist", "admins"))
@@ -1425,7 +1657,11 @@ async def cmd_blacklist(message: Message, session: AsyncSession) -> None:
 async def cmd_setwelcome(message: Message, session: AsyncSession) -> None:
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("استفاده: /setwelcome متن\nمتغیرها: {name} {mention} {id} {chat}")
+        _pending_text_setup[(message.chat.id, message.from_user.id)] = "welcome"
+        await message.reply(
+            "✍️ باشه، حالا فقط متن خوش‌آمدگویی جدید رو همین‌جا بفرست (بدون هیچ دستوری) "
+            "تا خودکار ذخیره‌ش کنم.\nمتغیرهای قابل‌استفاده: {name} {mention} {id} {chat}"
+        )
         return
     chat = await get_or_create_chat(session, message.chat)
     chat.welcome_text = args[1]
@@ -1456,13 +1692,47 @@ async def cmd_rules(message: Message, session: AsyncSession) -> None:
 async def cmd_setrules(message: Message, session: AsyncSession) -> None:
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("استفاده: /setrules متن قوانین")
+        _pending_text_setup[(message.chat.id, message.from_user.id)] = "rules"
+        await message.reply("✍️ باشه، حالا فقط متن قوانین جدید رو همین‌جا بفرست تا خودکار ذخیره‌ش کنم.")
         return
     chat = await get_or_create_chat(session, message.chat)
     chat.rules_text = args[1]
     session.add(chat)
     await session.commit()
     await message.reply("✅ قوانین بروزرسانی شد.")
+
+
+# --- گرفتن متن خوش‌آمدگویی/قوانین وقتی ادمین منتظرشه (بدون نیاز به تکرار دستور) ---
+class PendingTextSetupFilter(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if not message.text or message.text.startswith("/"):
+            return False
+        if message.chat.type not in ("group", "supergroup"):
+            return False
+        return (message.chat.id, message.from_user.id) in _pending_text_setup
+
+
+@router.message(PendingTextSetupFilter())
+async def catch_pending_text_setup(message: Message, session: AsyncSession) -> None:
+    key = (message.chat.id, message.from_user.id)
+    kind = _pending_text_setup.get(key)
+    if kind is None:
+        return
+    if not await is_chat_admin(message.bot, message.chat.id, message.from_user.id):
+        return
+
+    chat = await get_or_create_chat(session, message.chat)
+    if kind == "welcome":
+        chat.welcome_text = message.text
+        session.add(chat)
+        await session.commit()
+        await message.reply("✅ متن خوش‌آمدگویی ذخیره شد.")
+    elif kind == "rules":
+        chat.rules_text = message.text
+        session.add(chat)
+        await session.commit()
+        await message.reply("✅ قوانین ذخیره شد.")
+    del _pending_text_setup[key]
 
 
 # --- اخطار و ضداسپم (تنظیمات متنی) ---
@@ -1722,6 +1992,7 @@ async def scheduler_loop(bot: Bot) -> None:
                     try:
                         if action.action == "unmute":
                             await bot.restrict_chat_member(action.chat_id, action.user_id, permissions=DEFAULT_PERMISSIONS)
+                            unmark_muted(action.chat_id, action.user_id)
                         elif action.action == "unban":
                             await bot.unban_chat_member(action.chat_id, action.user_id, only_if_banned=True)
                         elif action.action == "unlockall":
